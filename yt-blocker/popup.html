@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 220px; font-family: -apple-system, sans-serif; padding: 15px; background: #f9f9f9; }
+    h2 { font-size: 16px; margin: 0 0 15px; color: #ff0000; text-align: center; }
+    .toggle { display: flex; align-items: center; margin-bottom: 12px; }
+    input { margin-right: 12px; transform: scale(1.2); cursor: pointer; }
+    label { font-size: 14px; cursor: pointer; color: #333; }
+    hr { border: 0; border-top: 1px solid #ddd; margin: 15px 0; }
+  </style>
+</head>
+<body>
+  <h2>YT Power Blocker</h2>
+  <div class="toggle"><input type="checkbox" id="adblock"> <label for="adblock"><b>Total Ad Block</b></label></div>
+  <hr>
+  <div class="toggle"><input type="checkbox" id="home"> <label for="home">Hide Home Feed</label></div>
+  <div class="toggle"><input type="checkbox" id="sidebar"> <label for="sidebar">Hide Sidebar</label></div>
+  <div class="toggle"><input type="checkbox" id="comments"> <label for="comments">Hide Comments</label></div>
+  <script src="popup.js"></script>
+</body>
+</html>

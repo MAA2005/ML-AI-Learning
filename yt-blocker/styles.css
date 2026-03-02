@@ -1,0 +1,14 @@
+/* Hide the homepage feed */
+ytd-browse[page-subtype="home"] #contents {
+    display: none !important;
+}
+
+/* Hide the "Up Next" sidebar on video pages */
+#secondary {
+    display: none !important;
+}
+
+/* Hide the comments section */
+#comments {
+    display: none !important;
+}
