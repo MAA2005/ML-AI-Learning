@@ -161,8 +161,9 @@ async function addProvider(args: string[]): Promise<void> {
   // --kind overrides the template (needed for a self-hosted Anthropic-shaped
   // endpoint, or an unknown id that speaks the Messages API).
   const kindFlag = flags["kind"];
-  if (kindFlag && kindFlag !== "anthropic" && kindFlag !== "openai-compatible") {
-    console.error(`Unknown --kind "${kindFlag}". Use "anthropic" or "openai-compatible".`);
+  const KINDS = ["anthropic", "gemini", "openai-compatible"];
+  if (kindFlag && !KINDS.includes(kindFlag)) {
+    console.error(`Unknown --kind "${kindFlag}". Use one of: ${KINDS.join(", ")}.`);
     process.exit(1);
   }
   const kind = (kindFlag as ProviderKind | undefined) ?? known?.kind;

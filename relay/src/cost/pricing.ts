@@ -57,6 +57,31 @@ export const DEFAULT_PRICING: PricingTable = {
     "claude-haiku-4-5": { inputPerMTok: 1, outputPerMTok: 5, ...CACHE_DEFAULTS },
     "claude-fable-5": { inputPerMTok: 10, outputPerMTok: 50, ...CACHE_DEFAULTS },
   },
+  // Gemini folds cached tokens into promptTokenCount and bills them cheaper;
+  // the adapter splits them out, and cached input is priced at ~0.25x here
+  // (Gemini also bills cache storage per hour — not modeled; edit if it matters).
+  // VERIFY: Gemini pricing is context-length tiered — these are the small-context
+  // rates.
+  gemini: {
+    "gemini-2.0-flash": {
+      inputPerMTok: 0.1,
+      outputPerMTok: 0.4,
+      cacheWriteMultiplier: 1,
+      cacheReadMultiplier: 0.25,
+    },
+    "gemini-1.5-flash": {
+      inputPerMTok: 0.075,
+      outputPerMTok: 0.3,
+      cacheWriteMultiplier: 1,
+      cacheReadMultiplier: 0.25,
+    },
+    "gemini-1.5-pro": {
+      inputPerMTok: 1.25,
+      outputPerMTok: 5,
+      cacheWriteMultiplier: 1,
+      cacheReadMultiplier: 0.25,
+    },
+  },
   groq: {
     "llama-3.3-70b-versatile": {
       inputPerMTok: 0.59,

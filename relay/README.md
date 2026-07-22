@@ -110,7 +110,8 @@ client tool ─▶ Fastify server (/v1/chat)
   `retriable` signal the router will key off of.
 - **`src/adapters/openai-compatible.ts`** — the OpenAI-shaped adapter. Uses only
   user-supplied `baseUrl` + `apiKey`; sends an honest `relay-gateway/x.y.z` UA.
-- **`src/adapters/anthropic.ts`** — the native Messages API adapter (see above).
+- **`src/adapters/anthropic.ts`** / **`src/adapters/gemini.ts`** — the native
+  Messages API and Generative Language API adapters (see above).
   `src/registry.ts` dispatches on the provider's `kind`.
 - **`src/adapters/sse.ts`** — shared SSE line parser; each adapter's `chatStream`
   interprets the payloads in its own provider's shape.
@@ -150,14 +151,15 @@ verify compliance yourself.
 | ----------------- | ------------------------ | ------------------ | -------------------------------------------------- |
 | OpenAI            | Your API key (Bearer)    | openai-compatible  | https://openai.com/policies/usage-policies         |
 | Anthropic         | Your API key (`x-api-key`) | **native**       | https://www.anthropic.com/legal/commercial-terms   |
+| Gemini            | Your API key (`x-goog-api-key`) | **native**  | https://ai.google.dev/gemini-api/terms             |
 | OpenAI-compatible | Your base URL + key      | openai-compatible  | (the specific vendor's API terms)                  |
 | Groq              | Your API key             | openai-compatible  | https://groq.com/terms-of-use/                     |
 | Mistral           | Your API key             | openai-compatible  | https://mistral.ai/terms/                          |
 | Ollama (local)    | None (localhost)         | openai-compatible  | https://github.com/ollama/ollama                   |
-| Gemini            | Your API key *(planned)* | —                  | https://ai.google.dev/gemini-api/terms             |
 
 Pricing pages to verify against when editing `relay.pricing.json`:
-[OpenAI](https://openai.com/api/pricing/) · [Anthropic](https://www.anthropic.com/pricing).
+[OpenAI](https://openai.com/api/pricing/) · [Anthropic](https://www.anthropic.com/pricing) ·
+[Gemini](https://ai.google.dev/gemini-api/docs/pricing).
 
 ## The native Anthropic adapter
 
@@ -197,6 +199,30 @@ mangles the edge cases:
 ```bash
 relay add-provider anthropic          # native adapter, validated live
 relay add-provider my-claude-proxy --kind anthropic --base-url http://localhost:8000/v1
+```
+
+## The native Gemini adapter
+
+Gemini goes through its own native adapter (`src/adapters/gemini.ts`) for the
+same reason as Anthropic — the Generative Language API is a different shape, and
+each difference is a place a shim gets it wrong:
+
+| Concern | OpenAI-compatible | Gemini native |
+| --- | --- | --- |
+| Endpoint | `POST /chat/completions` | `POST /models/{model}:generateContent` — operation is a **URL suffix**, model is in the **path** |
+| Auth | `Authorization: Bearer` | `x-goog-api-key` header (never the `?key=` query form, so the key can't land in a URL/log) |
+| Messages | `role: "system"/"user"/"assistant"` | `contents: [{role:"user"/"model", parts:[{text}]}]` — **no `assistant`**, and `system` is a separate top-level `systemInstruction` (multi-turn system messages hoisted + joined) |
+| Finish reasons | `stop` / `length` | `STOP` / `MAX_TOKENS` / **`SAFETY`** … (uppercase); a `SAFETY` block is a successful 200 surfaced as a `finishReason`, not a retried error |
+| Errors | HTTP status | a `status` string (`RESOURCE_EXHAUSTED`, `UNAUTHENTICATED`, …) mapped onto the shared retriable split |
+| Usage | 3 counts | `usageMetadata` with `cachedContentTokenCount` folded **into** `promptTokenCount` — the adapter splits it back out so cached input is priced at its own (~0.25×) rate |
+
+Streaming uses `:streamGenerateContent?alt=sse` and, unlike OpenAI, sends **no
+`[DONE]` terminator** — the stream just ends; the gateway still emits an
+OpenAI-style `[DONE]` to its own clients.
+
+```bash
+relay add-provider gemini             # native adapter, validated live
+relay add-provider my-gemini-proxy --kind gemini --base-url http://localhost:8000/v1beta
 ```
 
 ## Routing / fallback engine

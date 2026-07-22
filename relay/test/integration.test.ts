@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AnthropicAdapter } from "../src/adapters/anthropic.js";
+import { GeminiAdapter } from "../src/adapters/gemini.js";
 import { OpenAICompatibleAdapter } from "../src/adapters/openai-compatible.js";
 import type { ChatRequest, ProviderAdapter } from "../src/adapters/types.js";
 import type { Chain } from "../src/config/chains.js";
@@ -136,6 +137,68 @@ describe("native Anthropic adapter through the router", () => {
     expect(result.response.provider).toBe("b");
     expect(result.attempts[0]).toMatchObject({ provider: "anthropic", errorKind: "server" });
     expect(call).toBe(2);
+  });
+});
+
+describe("native Gemini adapter through the router", () => {
+  function gemini(id: string): GeminiAdapter {
+    return new GeminiAdapter({
+      id,
+      kind: "gemini",
+      baseUrl: "https://gen.test/v1beta",
+      apiKey: KEY,
+    });
+  }
+
+  it("stops the chain on a Gemini UNAUTHENTICATED (401)", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: { code: 401, status: "UNAUTHENTICATED" } }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const registry = new Map<string, ProviderAdapter>([
+      ["gemini", gemini("gemini")],
+      ["b", realAdapter("b")],
+    ]);
+    const router = new Router(registry, []);
+    try {
+      await router.run(REQ, chain([{ id: "gemini" }, { id: "b" }]));
+      expect.unreachable();
+    } catch (e) {
+      expect((e as RoutingError).lastError?.kind).toBe("auth");
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1); // no failover past auth
+  });
+
+  it("fails over on a Gemini RESOURCE_EXHAUSTED (429)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (String(url).includes("gen.test")) {
+          return new Response(JSON.stringify({ error: { status: "RESOURCE_EXHAUSTED" } }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            model: "m",
+            choices: [{ message: { content: "fallback" }, finish_reason: "stop" }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }),
+    );
+    const registry = new Map<string, ProviderAdapter>([
+      ["gemini", gemini("gemini")],
+      ["b", realAdapter("b")],
+    ]);
+    const result = await new Router(registry, []).run(REQ, chain([{ id: "gemini" }, { id: "b" }]));
+    expect(result.response.provider).toBe("b");
+    expect(result.attempts[0]).toMatchObject({ provider: "gemini", errorKind: "rate_limit" });
   });
 });
 

@@ -38,7 +38,7 @@ export const ProviderDef = z.object({
   id: z.string().min(1),
   label: z.string().optional(),
   /** Adapter implementation; omitted means "openai-compatible". */
-  kind: z.enum(["openai-compatible", "anthropic"]).optional(),
+  kind: z.enum(["openai-compatible", "anthropic", "gemini"]).optional(),
   baseUrl: z.string().url(),
   defaultModel: z.string().optional(),
 });

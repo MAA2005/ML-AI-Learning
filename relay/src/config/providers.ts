@@ -21,6 +21,7 @@ export const EnvSchema = z.object({
 
   OPENAI_API_KEY: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
+  GEMINI_API_KEY: z.string().optional(),
   OPENAI_COMPAT_BASE_URL: z.string().url().optional(),
   OPENAI_COMPAT_API_KEY: z.string().optional(),
   OLLAMA_BASE_URL: z.string().url().optional(),
@@ -56,6 +57,12 @@ export const KNOWN_PROVIDERS: Record<
     defaultModel: "claude-opus-4-8",
     kind: "anthropic",
   },
+  gemini: {
+    label: "Google Gemini",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    defaultModel: "gemini-2.0-flash",
+    kind: "gemini",
+  },
   groq: { label: "Groq", baseUrl: "https://api.groq.com/openai/v1" },
   mistral: { label: "Mistral", baseUrl: "https://api.mistral.ai/v1" },
   together: { label: "Together", baseUrl: "https://api.together.xyz/v1" },
@@ -83,9 +90,11 @@ function envKeyFor(id: string, env: NodeJS.ProcessEnv): string | undefined {
       ? env.OPENAI_API_KEY
       : id === "anthropic"
         ? env.ANTHROPIC_API_KEY
-        : id === "openai-compat"
-          ? env.OPENAI_COMPAT_API_KEY
-          : undefined;
+        : id === "gemini"
+          ? env.GEMINI_API_KEY
+          : id === "openai-compat"
+            ? env.OPENAI_COMPAT_API_KEY
+            : undefined;
   return specific || genericEnvKey(id, env);
 }
 
@@ -97,6 +106,9 @@ function envDefinitions(env: NodeJS.ProcessEnv): ProviderDef[] {
   }
   if (env.ANTHROPIC_API_KEY) {
     defs.push({ id: "anthropic", ...KNOWN_PROVIDERS.anthropic! });
+  }
+  if (env.GEMINI_API_KEY) {
+    defs.push({ id: "gemini", ...KNOWN_PROVIDERS.gemini! });
   }
   if (env.OPENAI_COMPAT_BASE_URL) {
     defs.push({

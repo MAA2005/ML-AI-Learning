@@ -113,9 +113,10 @@ export type Capability = "chat" | "embeddings" | "vision" | "audio";
 
 /**
  * Which adapter implementation serves a provider. Defaults to
- * "openai-compatible"; "anthropic" selects the native Messages API adapter.
+ * "openai-compatible"; "anthropic" selects the native Messages API adapter;
+ * "gemini" the native Google Generative Language API adapter.
  */
-export type ProviderKind = "openai-compatible" | "anthropic";
+export type ProviderKind = "openai-compatible" | "anthropic" | "gemini";
 
 export interface ProviderConfig {
   /** Stable id used in routing chains and logs, e.g. "openai" or "groq-1". */

@@ -1,4 +1,5 @@
 import { AnthropicAdapter } from "./adapters/anthropic.js";
+import { GeminiAdapter } from "./adapters/gemini.js";
 import { OpenAICompatibleAdapter } from "./adapters/openai-compatible.js";
 import type { ProviderAdapter, ProviderConfig } from "./adapters/types.js";
 
@@ -11,6 +12,8 @@ export function buildAdapter(cfg: ProviderConfig): ProviderAdapter {
   switch (cfg.kind) {
     case "anthropic":
       return new AnthropicAdapter(cfg);
+    case "gemini":
+      return new GeminiAdapter(cfg);
     case "openai-compatible":
     case undefined:
       return new OpenAICompatibleAdapter(cfg);
