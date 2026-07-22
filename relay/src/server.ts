@@ -1,16 +1,249 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import type { ServerResponse } from "node:http";
 import { z } from "zod";
-import { ChatRequest, type ProviderAdapter, type ProviderConfig } from "./adapters/types.js";
+import {
+  ChatRequest,
+  type ProviderAdapter,
+  type ProviderConfig,
+  type TokenUsage,
+} from "./adapters/types.js";
 import { compressMessages, getEngine } from "./compression/index.js";
 import { loadRelayConfig, type Chain } from "./config/chains.js";
 import { loadServerSettings, resolveProviders } from "./config/providers.js";
-import { NdjsonLedger, type UsageLedger } from "./cost/ledger.js";
+import { NdjsonLedger, type UsageEntry, type UsageLedger } from "./cost/ledger.js";
 import { openLedger } from "./cost/open-ledger.js";
 import { computeCostUsd, loadPricing, type PricingTable } from "./cost/pricing.js";
 import { buildRegistry } from "./registry.js";
 import { defaultBreakerStatePath, writeBreakerState } from "./routing/breaker-state.js";
-import { Router, RoutingError } from "./routing/router.js";
+import { Router, RoutingError, type RouteStreamEvent } from "./routing/router.js";
 import { openSecretStore, type SecretStore } from "./secrets/store.js";
+
+// --- SSE helpers (OpenAI-compatible chunk shape) ---------------------------
+
+function sse(raw: ServerResponse, payload: unknown): void {
+  raw.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+function sseDone(raw: ServerResponse): void {
+  raw.write("data: [DONE]\n\n");
+}
+
+/** An OpenAI-shaped streaming chunk carrying one content delta. */
+function deltaChunk(id: string, model: string, created: number, text: string): unknown {
+  return {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+  };
+}
+
+/**
+ * The terminal chunk: an empty delta with the finish_reason and usage, plus an
+ * `x_relay` extension carrying the honest-transparency data that can't ride in
+ * headers once the body is already streaming (cost, cache split, attempt count).
+ */
+function finalChunk(
+  id: string,
+  model: string,
+  created: number,
+  finishReason: string | null,
+  usage: TokenUsage | null,
+  extra: { provider: string; chain: string; costUsd: number | null; attempts: number },
+): unknown {
+  return {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: finishReason ?? "stop" }],
+    usage: usage
+      ? {
+          prompt_tokens: usage.promptTokens,
+          completion_tokens: usage.completionTokens,
+          total_tokens: usage.totalTokens,
+        }
+      : null,
+    x_relay: {
+      provider: extra.provider,
+      chain: extra.chain,
+      attempts: extra.attempts,
+      cost_usd: extra.costUsd,
+      usage_detail: usage
+        ? {
+            cache_creation_input_tokens: usage.cacheCreationInputTokens,
+            cache_read_input_tokens: usage.cacheReadInputTokens,
+          }
+        : null,
+    },
+  };
+}
+
+interface StreamPipeCtx {
+  model: string;
+  pricing: PricingTable;
+  ledger: UsageLedger;
+  now: () => number;
+  compression?: { engine: string; before: number; after: number };
+  log: (obj: object, msg: string) => void;
+}
+
+/**
+ * Consume a router stream and write it out as OpenAI-compatible SSE.
+ *
+ * Header timing is the crux: `x-relay-*` headers go out with the SSE response
+ * head on the `committed` event — the last moment before the body starts. A
+ * PRE-commit failure throws (the generator hasn't emitted `committed` yet), so
+ * Fastify still owns the reply and we send a normal JSON error, exactly like the
+ * non-streaming path. Cost/usage — known only at `final` — ride in the terminal
+ * chunk's `x_relay` field, and that's where the ledger row is written.
+ */
+async function pipeStream(
+  gen: AsyncGenerator<RouteStreamEvent>,
+  reply: FastifyReply,
+  ctx: StreamPipeCtx,
+): Promise<void> {
+  const raw = reply.raw;
+  const created = Math.floor(ctx.now() / 1000);
+  const id = `relay-${ctx.now().toString(36)}`;
+  let committed = false;
+
+  const recordRow = (over: Partial<UsageEntry>): void =>
+    ctx.ledger.record({
+      ts: ctx.now(),
+      provider: ctx.model,
+      model: ctx.model,
+      chain: "",
+      promptTokens: null,
+      completionTokens: null,
+      totalTokens: null,
+      costUsd: null,
+      latencyMs: 0,
+      outcome: "success",
+      ...over,
+    });
+
+  try {
+    for await (const ev of gen) {
+      switch (ev.type) {
+        case "committed": {
+          raw.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+            "x-relay-chain": ev.chain,
+            "x-relay-provider": ev.provider,
+            "x-relay-attempts": String(ev.attempts.length),
+            ...(ctx.compression
+              ? {
+                  "x-relay-compress-engine": ctx.compression.engine,
+                  "x-relay-compress-before": String(ctx.compression.before),
+                  "x-relay-compress-after": String(ctx.compression.after),
+                }
+              : {}),
+          });
+          reply.hijack();
+          committed = true;
+          break;
+        }
+        case "delta":
+          sse(raw, deltaChunk(id, ctx.model, created, ev.text));
+          break;
+        case "final": {
+          const { result } = ev;
+          const costUsd = computeCostUsd(ctx.pricing, result.provider, result.model, result.usage);
+          recordRow({
+            provider: result.provider,
+            model: result.model,
+            chain: ev.chain,
+            promptTokens: result.usage?.promptTokens ?? null,
+            completionTokens: result.usage?.completionTokens ?? null,
+            totalTokens: result.usage?.totalTokens ?? null,
+            costUsd,
+            latencyMs: result.latencyMs,
+            outcome: "success",
+          });
+          sse(
+            raw,
+            finalChunk(id, result.model, created, result.finishReason, result.usage, {
+              provider: result.provider,
+              chain: ev.chain,
+              costUsd,
+              attempts: ev.attempts.length,
+            }),
+          );
+          sseDone(raw);
+          raw.end();
+          ctx.log(
+            { chain: ev.chain, provider: result.provider, costUsd, streamed: true },
+            "routed (stream)",
+          );
+          break;
+        }
+        case "stream_error": {
+          // Committed provider failed mid-stream — record the failure and tell
+          // the client honestly rather than leaving the connection hanging.
+          recordRow({ provider: ev.provider, chain: ev.chain, outcome: "error" });
+          sse(raw, {
+            error: { type: ev.error.kind, message: ev.error.message, provider: ev.provider },
+          });
+          sseDone(raw);
+          raw.end();
+          ctx.log(
+            { chain: ev.chain, provider: ev.provider, errorKind: ev.error.kind, streamed: true },
+            "stream error after commit",
+          );
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    if (!committed) {
+      // Pre-commit: Fastify still owns the reply — send a normal JSON error.
+      sendRoutingError(err, reply, ctx.log);
+    } else {
+      // Post-commit errors are delivered as stream_error events, not throws, so
+      // this is a belt-and-suspenders guard against a hung socket.
+      try {
+        sse(raw, { error: { message: "internal stream error" } });
+        sseDone(raw);
+        raw.end();
+      } catch {
+        /* socket already gone */
+      }
+    }
+  }
+}
+
+/** Map a RoutingError (or anything else) to a JSON error response. Shared by the
+ *  streaming pre-commit path and the non-streaming catch. */
+function sendRoutingError(
+  err: unknown,
+  reply: FastifyReply,
+  log: (obj: object, msg: string) => void,
+): void {
+  if (err instanceof RoutingError) {
+    log({ chain: err.chain, attempts: err.attempts }, "routing failed");
+    reply.header("x-relay-chain", err.chain);
+    reply.header("x-relay-attempts", String(err.attempts.length));
+    const last = err.lastError;
+    const status =
+      last?.kind === "bad_request"
+        ? 400
+        : last?.kind === "rate_limit"
+          ? 429
+          : 502;
+    reply.status(status).send({
+      error: last?.kind ?? "routing_failed",
+      chain: err.chain,
+      detail: err.message,
+      attempts: err.attempts,
+    });
+    return;
+  }
+  log({ err: String(err) }, "internal error");
+  reply.status(500).send({ error: "internal", detail: String(err) });
+}
 
 /**
  * v0 gateway. Multi-provider round-trip end to end:
@@ -126,6 +359,22 @@ export function buildServer(cfg: BuiltServerConfig): FastifyInstance {
       }
     }
 
+    // --- Streaming path (opt-in via "stream": true) ------------------------
+    if (chatReq.stream) {
+      const gen = provider
+        ? router.streamRun(chatReq, router.singleProviderChain(provider))
+        : router.streamChat(chatReq, chain);
+      await pipeStream(gen, reply, {
+        model: chatReq.model,
+        pricing,
+        ledger,
+        now,
+        compression,
+        log: (o, m) => request.log.info(o, m),
+      });
+      return reply;
+    }
+
     try {
       // A direct `provider` bypasses fallback (single-provider chain); otherwise
       // route through the named or default chain with failover + breaker.
@@ -166,28 +415,8 @@ export function buildServer(cfg: BuiltServerConfig): FastifyInstance {
       );
       return reply.send(response);
     } catch (err) {
-      if (err instanceof RoutingError) {
-        request.log.warn({ chain: err.chain, attempts: err.attempts }, "routing failed");
-        reply.header("x-relay-chain", err.chain);
-        reply.header("x-relay-attempts", String(err.attempts.length));
-        const last = err.lastError;
-        const httpStatus =
-          last?.kind === "bad_request"
-            ? 400
-            : last?.kind === "rate_limit"
-              ? 429
-              : last?.kind === "auth"
-                ? 502
-                : 502;
-        return reply.status(httpStatus).send({
-          error: last?.kind ?? "routing_failed",
-          chain: err.chain,
-          detail: err.message,
-          attempts: err.attempts,
-        });
-      }
-      request.log.error(err);
-      return reply.status(500).send({ error: "internal", detail: String(err) });
+      sendRoutingError(err, reply, (o, m) => request.log.warn(o, m));
+      return reply;
     }
   });
 

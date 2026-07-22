@@ -73,6 +73,38 @@ export const ChatResponse = z.object({
 });
 export type ChatResponse = z.infer<typeof ChatResponse>;
 
+/** One incremental text delta from a streaming chat. */
+export interface StreamDelta {
+  text: string;
+}
+
+/**
+ * The terminal value of a chat stream — the same normalized metadata a
+ * non-streaming `ChatResponse` carries, minus the concatenated content (the
+ * caller has already seen every delta). Returned as the generator's return
+ * value, so `for await` yields deltas and the final `.next()` carries this.
+ */
+export interface StreamResult {
+  provider: string;
+  model: string;
+  finishReason: string | null;
+  usage: TokenUsage | null;
+  latencyMs: number;
+}
+
+/**
+ * A streaming chat. Yields text deltas and returns a `StreamResult`.
+ *
+ * FAILOVER CONTRACT: an adapter MUST throw its `AdapterError` (with the right
+ * retriable classification) BEFORE yielding the first delta if the upstream
+ * call fails to establish — a bad key, a 429, a 5xx on connect. That first
+ * moment is the only point at which the router can still fail over to another
+ * provider, because nothing has reached the client yet. Once the first delta is
+ * yielded the provider is committed; a mid-stream failure surfaces to the caller
+ * as a truncated stream, never as a silent retry on a different provider.
+ */
+export type ChatStream = AsyncGenerator<StreamDelta, StreamResult, void>;
+
 // ---------------------------------------------------------------------------
 // Capabilities & config
 // ---------------------------------------------------------------------------
@@ -165,6 +197,13 @@ export interface ProviderAdapter {
   /** Normalized, non-streaming chat completion. */
   chat(req: ChatRequest): Promise<ChatResponse>;
 
-  // Streaming / embeddings / vision / audio are added incrementally as each
-  // capability lands, so the contract stays honest about what actually works.
+  /**
+   * Streaming chat. Optional — capability-detected by the router, which falls
+   * back to a clear error if a targeted provider can't stream. See `ChatStream`
+   * for the pre-first-token failover contract.
+   */
+  chatStream?(req: ChatRequest): ChatStream;
+
+  // Embeddings / vision / audio are added incrementally as each capability
+  // lands, so the contract stays honest about what actually works.
 }

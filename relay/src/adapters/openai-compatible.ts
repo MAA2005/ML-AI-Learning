@@ -3,10 +3,12 @@ import {
   ChatRequest,
   ChatResponse,
   type Capability,
+  type ChatStream,
   type HealthResult,
   type ProviderAdapter,
   type ProviderConfig,
 } from "./types.js";
+import { parseSse } from "./sse.js";
 import { z } from "zod";
 
 /**
@@ -40,6 +42,17 @@ const OpenAIChatCompletion = z.object({
     })
     .optional(),
 });
+
+/** The slice of an OpenAI streaming chunk we read (parsed, not Zod-validated —
+ *  streaming is hot-path and chunks are tiny and self-consistent). */
+interface OpenAIStreamChunk {
+  model?: string;
+  choices?: Array<{
+    delta?: { content?: string | null };
+    finish_reason?: string | null;
+  }>;
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+}
 
 export class OpenAICompatibleAdapter implements ProviderAdapter {
   readonly id: string;
@@ -100,18 +113,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       );
     }
 
-    const body: Record<string, unknown> = {
-      model,
-      messages: req.messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-        ...(m.name ? { name: m.name } : {}),
-        ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
-      })),
-      ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-      ...(req.maxTokens !== undefined ? { max_tokens: req.maxTokens } : {}),
-      ...(req.extra ?? {}),
-    };
+    const body = this.buildBody(req, model);
 
     const started = performance.now();
     let res: Response;
@@ -178,7 +180,121 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     };
   }
 
+  /**
+   * Streaming chat over the OpenAI SSE protocol. Honors the failover contract:
+   * any connect-time failure throws BEFORE the first delta is yielded, so the
+   * router can still switch providers; once tokens flow, this provider is
+   * committed. `stream_options.include_usage` asks for a final usage chunk —
+   * compat endpoints that ignore it simply leave `usage` null (never faked).
+   */
+  async *chatStream(reqInput: ChatRequest): ChatStream {
+    const req = ChatRequest.parse(reqInput);
+    const model = this.resolveModel(req.model);
+    const body = {
+      ...this.buildBody(req, model),
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+
+    const started = performance.now();
+    // Time-limit only the connection, not the stream body (a long stream is fine).
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { ...this.headers(), "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw this.toAdapterError(err);
+    }
+    clearTimeout(timer);
+
+    // These throws happen before any yield → the router can still fail over.
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new AdapterError(
+        `Provider "${this.id}" returned HTTP ${res.status}: ${this.redact(text).slice(0, 500)}`,
+        classifyStatus(res.status),
+        this.id,
+        res.status,
+        { retryAfterMs: parseRetryAfterMs(res.headers.get("retry-after")) },
+      );
+    }
+    if (!res.body) {
+      throw new AdapterError(`Provider "${this.id}" streamed no body.`, "server", this.id);
+    }
+
+    let servedModel = model;
+    let finishReason: string | null = null;
+    let usage: ChatResponse["usage"] = null;
+
+    for await (const ev of parseSse(res.body)) {
+      if (ev.data === "[DONE]") break;
+      let chunk: OpenAIStreamChunk;
+      try {
+        chunk = JSON.parse(ev.data);
+      } catch {
+        continue; // ignore keep-alive / malformed lines
+      }
+      if (chunk.model) servedModel = chunk.model;
+      const choice = chunk.choices?.[0];
+      if (choice?.delta?.content) {
+        yield { text: choice.delta.content };
+      }
+      if (choice?.finish_reason) finishReason = choice.finish_reason;
+      if (chunk.usage) {
+        usage = {
+          promptTokens: chunk.usage.prompt_tokens,
+          completionTokens: chunk.usage.completion_tokens,
+          totalTokens: chunk.usage.total_tokens,
+          cacheCreationInputTokens: null,
+          cacheReadInputTokens: null,
+        };
+      }
+    }
+
+    return {
+      provider: this.id,
+      model: servedModel,
+      finishReason,
+      usage,
+      latencyMs: Math.round(performance.now() - started),
+    };
+  }
+
   // -------------------------------------------------------------------------
+
+  private resolveModel(requested: string): string {
+    const model = requested || this.defaultModel;
+    if (!model) {
+      throw new AdapterError(
+        `No model specified and provider "${this.id}" has no defaultModel.`,
+        "bad_request",
+        this.id,
+      );
+    }
+    return model;
+  }
+
+  private buildBody(req: ChatRequest, model: string): Record<string, unknown> {
+    return {
+      model,
+      messages: req.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.name ? { name: m.name } : {}),
+        ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
+      })),
+      ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
+      ...(req.maxTokens !== undefined ? { max_tokens: req.maxTokens } : {}),
+      ...(req.extra ?? {}),
+    };
+  }
 
   /**
    * Defense-in-depth: strip our own key from any text (e.g. an error body a

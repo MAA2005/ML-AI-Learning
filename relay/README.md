@@ -85,7 +85,7 @@ curl -s http://127.0.0.1:8787/v1/chat \
 
 | Method | Path             | Purpose                                        |
 | ------ | ---------------- | ---------------------------------------------- |
-| POST   | `/v1/chat`       | Normalized chat completion, routed w/ fallback |
+| POST   | `/v1/chat`       | Chat completion, routed w/ fallback; SSE when `"stream": true` |
 | GET    | `/v1/providers`  | List configured providers + capabilities       |
 | GET    | `/v1/usage`      | Tokens + $ per provider, and recent calls      |
 | GET    | `/health`        | Per-provider connectivity/auth probe           |
@@ -112,6 +112,8 @@ client tool ─▶ Fastify server (/v1/chat)
   user-supplied `baseUrl` + `apiKey`; sends an honest `relay-gateway/x.y.z` UA.
 - **`src/adapters/anthropic.ts`** — the native Messages API adapter (see above).
   `src/registry.ts` dispatches on the provider's `kind`.
+- **`src/adapters/sse.ts`** — shared SSE line parser; each adapter's `chatStream`
+  interprets the payloads in its own provider's shape.
 - **`src/routing/router.ts`** — chain resolution, strategy ordering, failover,
   and the transparent per-attempt log. **`src/routing/breaker.ts`** — the
   per-provider circuit breaker (Retry-After aware, 2-success close).
@@ -228,6 +230,36 @@ only owns chain topology, so it's safe to diff and comment (`.jsonc` supported).
 **Request routing selectors** on `POST /v1/chat`:
 `"chain": "name"` routes through a named chain; `"provider": "id"` targets one
 provider directly (no fallback); neither → the default (first) chain.
+
+### Streaming (`"stream": true`)
+
+`POST /v1/chat` with `"stream": true` responds with OpenAI-compatible
+`text/event-stream` SSE — so existing chat UIs and SDKs that already speak
+OpenAI streaming work unchanged when pointed at Relay. Each adapter speaks its
+provider's native stream shape (OpenAI's `data:` chunks vs. Anthropic's named
+events) and normalizes to the same delta/usage contract.
+
+- **Failover has a hard, honest boundary.** The router can transparently fail
+  over to the next provider on a connect-time error (bad key, 429, 5xx) because
+  nothing has reached the client yet. Once the **first token** is emitted the
+  provider is committed — a mid-stream failure surfaces as an SSE `error` event,
+  never a silent retry that would duplicate or truncate output. Pre-commit
+  failures come back as a normal JSON error (not a half-open stream).
+- **Transparency rides the stream.** `x-relay-chain` / `x-relay-provider` /
+  `x-relay-attempts` are sent as SSE response headers at commit; cost, the cache
+  split, and attempt count — known only at end-of-stream — arrive in the final
+  chunk's `x_relay` extension field, and that's where the ledger row is written.
+
+```bash
+curl -N -sX POST localhost:8787/v1/chat -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","stream":true,
+       "messages":[{"role":"user","content":"say hi"}]}'
+# data: {"choices":[{"delta":{"content":"Hi"}}]}
+# ...
+# data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{...},
+#        "x_relay":{"provider":"openai","cost_usd":0.00045,...}}
+# data: [DONE]
+```
 
 ### Request selection
 

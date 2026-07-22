@@ -1,10 +1,12 @@
 import { z } from "zod";
+import { parseSse } from "./sse.js";
 import {
   AdapterError,
   ChatRequest,
   type Capability,
   type ChatMessage,
   type ChatResponse,
+  type ChatStream,
   type HealthResult,
   type ProviderAdapter,
   type ProviderConfig,
@@ -63,6 +65,27 @@ const AnthropicMessage = z.object({
 const AnthropicErrorBody = z.object({
   error: z.object({ type: z.string().optional(), message: z.string().optional() }),
 });
+
+/** The slice of Anthropic's streaming events we read (parsed, not Zod-validated —
+ *  streaming is hot-path; the shape is stable per anthropic-version). */
+interface AnthropicStreamEvent {
+  type: string;
+  message?: {
+    model?: string;
+    usage?: {
+      input_tokens?: number;
+      cache_creation_input_tokens?: number | null;
+      cache_read_input_tokens?: number | null;
+    };
+  };
+  delta?: {
+    type?: string;
+    text?: string;
+    stop_reason?: string | null;
+  };
+  usage?: { output_tokens?: number };
+  error?: { type?: string; message?: string };
+}
 
 /**
  * Normalize Anthropic's stop_reason into the shared vocabulary so callers see
@@ -165,25 +188,8 @@ export class AnthropicAdapter implements ProviderAdapter {
 
   async chat(reqInput: ChatRequest): Promise<ChatResponse> {
     const req = ChatRequest.parse(reqInput);
-    const model = req.model || this.defaultModel;
-    if (!model) {
-      throw new AdapterError(
-        `No model specified and provider "${this.id}" has no defaultModel.`,
-        "bad_request",
-        this.id,
-      );
-    }
-
-    const { system, messages } = toAnthropicMessages(req.messages, this.id);
-
-    const body: Record<string, unknown> = {
-      model,
-      max_tokens: req.maxTokens ?? DEFAULT_MAX_TOKENS,
-      messages,
-      ...(system ? { system } : {}),
-      ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-      ...(req.extra ?? {}),
-    };
+    const model = this.resolveModel(req.model);
+    const body = this.buildBody(req, model);
 
     const started = performance.now();
     let res: Response;
@@ -198,29 +204,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     }
     const latencyMs = Math.round(performance.now() - started);
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      let errorType: string | undefined;
-      let detail = text;
-      try {
-        const parsed = AnthropicErrorBody.safeParse(JSON.parse(text));
-        if (parsed.success) {
-          errorType = parsed.data.error.type;
-          detail = parsed.data.error.message ?? text;
-        }
-      } catch {
-        /* non-JSON body — fall back to raw text */
-      }
-      throw new AdapterError(
-        `Provider "${this.id}" returned HTTP ${res.status}${
-          errorType ? ` (${errorType})` : ""
-        }: ${this.redact(detail).slice(0, 500)}`,
-        classifyAnthropicError(res.status, errorType),
-        this.id,
-        res.status,
-        { retryAfterMs: parseRetryAfterMs(res.headers.get("retry-after")) },
-      );
-    }
+    if (!res.ok) throw await this.errorFromResponse(res);
 
     const json = await res.json().catch((err) => {
       throw new AdapterError(
@@ -279,7 +263,168 @@ export class AnthropicAdapter implements ProviderAdapter {
     };
   }
 
+  /**
+   * Streaming chat over Anthropic's event stream — a genuinely different SSE
+   * shape from OpenAI's: named events (`message_start`, `content_block_delta`,
+   * `message_delta`, …) rather than one JSON chunk per line. Deltas come from
+   * `content_block_delta`; input usage from `message_start`, output usage and
+   * stop_reason from `message_delta`.
+   *
+   * Failover contract honored: connect-time failures throw before the first
+   * delta. A mid-stream `error` event is thrown too, but by then the provider is
+   * committed and the router surfaces it as a truncated stream, not a retry.
+   */
+  async *chatStream(reqInput: ChatRequest): ChatStream {
+    const req = ChatRequest.parse(reqInput);
+    const model = this.resolveModel(req.model);
+    const body = { ...this.buildBody(req, model), stream: true };
+
+    const started = performance.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/messages`, {
+        method: "POST",
+        headers: { ...this.headers(), "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw this.toAdapterError(err);
+    }
+    clearTimeout(timer);
+
+    if (!res.ok) throw await this.errorFromResponse(res); // before any yield
+    if (!res.body) {
+      throw new AdapterError(`Provider "${this.id}" streamed no body.`, "server", this.id);
+    }
+
+    let servedModel = model;
+    let stopReason: string | null = null;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheCreation: number | null = null;
+    let cacheRead: number | null = null;
+    let sawUsage = false;
+
+    for await (const ev of parseSse(res.body)) {
+      let payload: AnthropicStreamEvent;
+      try {
+        payload = JSON.parse(ev.data);
+      } catch {
+        continue;
+      }
+      switch (payload.type) {
+        case "message_start": {
+          const m = payload.message;
+          if (m?.model) servedModel = m.model;
+          if (m?.usage) {
+            sawUsage = true;
+            inputTokens = m.usage.input_tokens ?? 0;
+            cacheCreation = m.usage.cache_creation_input_tokens ?? null;
+            cacheRead = m.usage.cache_read_input_tokens ?? null;
+          }
+          break;
+        }
+        case "content_block_delta": {
+          if (payload.delta?.type === "text_delta" && payload.delta.text) {
+            yield { text: payload.delta.text };
+          }
+          break;
+        }
+        case "message_delta": {
+          if (payload.delta?.stop_reason !== undefined) {
+            stopReason = payload.delta.stop_reason;
+          }
+          if (payload.usage?.output_tokens !== undefined) {
+            sawUsage = true;
+            outputTokens = payload.usage.output_tokens;
+          }
+          break;
+        }
+        case "error": {
+          // Mid-stream error — the provider is already committed.
+          throw new AdapterError(
+            `Provider "${this.id}" stream error: ${this.redact(
+              payload.error?.message ?? "unknown",
+            )}`,
+            classifyAnthropicError(500, payload.error?.type),
+            this.id,
+          );
+        }
+        // message_stop / content_block_start / ping — nothing to do.
+      }
+    }
+
+    return {
+      provider: this.id,
+      model: servedModel,
+      finishReason: mapStopReason(stopReason),
+      usage: sawUsage
+        ? {
+            promptTokens: inputTokens,
+            completionTokens: outputTokens,
+            totalTokens: inputTokens + outputTokens + (cacheCreation ?? 0) + (cacheRead ?? 0),
+            cacheCreationInputTokens: cacheCreation,
+            cacheReadInputTokens: cacheRead,
+          }
+        : null,
+      latencyMs: Math.round(performance.now() - started),
+    };
+  }
+
   // -------------------------------------------------------------------------
+
+  private resolveModel(requested: string): string {
+    const model = requested || this.defaultModel;
+    if (!model) {
+      throw new AdapterError(
+        `No model specified and provider "${this.id}" has no defaultModel.`,
+        "bad_request",
+        this.id,
+      );
+    }
+    return model;
+  }
+
+  private buildBody(req: ChatRequest, model: string): Record<string, unknown> {
+    const { system, messages } = toAnthropicMessages(req.messages, this.id);
+    return {
+      model,
+      max_tokens: req.maxTokens ?? DEFAULT_MAX_TOKENS,
+      messages,
+      ...(system ? { system } : {}),
+      ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
+      ...(req.extra ?? {}),
+    };
+  }
+
+  /** Build a normalized AdapterError from a non-OK Messages API response. */
+  private async errorFromResponse(res: Response): Promise<AdapterError> {
+    const text = await res.text().catch(() => "");
+    let errorType: string | undefined;
+    let detail = text;
+    try {
+      const parsed = AnthropicErrorBody.safeParse(JSON.parse(text));
+      if (parsed.success) {
+        errorType = parsed.data.error.type;
+        detail = parsed.data.error.message ?? text;
+      }
+    } catch {
+      /* non-JSON body — fall back to raw text */
+    }
+    return new AdapterError(
+      `Provider "${this.id}" returned HTTP ${res.status}${
+        errorType ? ` (${errorType})` : ""
+      }: ${this.redact(detail).slice(0, 500)}`,
+      classifyAnthropicError(res.status, errorType),
+      this.id,
+      res.status,
+      { retryAfterMs: parseRetryAfterMs(res.headers.get("retry-after")) },
+    );
+  }
 
   private redact(text: string): string {
     if (!this.apiKey) return text;

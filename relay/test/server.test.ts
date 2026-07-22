@@ -165,6 +165,92 @@ describe("POST /v1/chat cost + usage wiring", () => {
     await app.close();
   });
 
+  it("streams OpenAI-compatible SSE and records a costed ledger row at end", async () => {
+    const OAI_STREAM =
+      [
+        'data: {"model":"gpt-4o-mini","choices":[{"delta":{"content":"Hel"}}]}',
+        'data: {"choices":[{"delta":{"content":"lo"}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500}}',
+        "data: [DONE]",
+      ].join("\n\n") + "\n\n";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(OAI_STREAM, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }),
+      ),
+    );
+    const ledger = new MemoryLedger();
+    const app = buildServer({
+      providers: [provider],
+      chains: [{ name: "default", strategy: "ordered", providers: [{ id: "openai" }] }],
+      ledger,
+      pricing: DEFAULT_PRICING,
+      now: () => 1_700_000_000_000,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/chat",
+      payload: { model: "gpt-4o-mini", stream: true, messages: [{ role: "user", content: "hi" }] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/event-stream");
+    expect(res.headers["x-relay-provider"]).toBe("openai");
+
+    // The SSE body carries the deltas, a final chunk with x_relay cost, and DONE.
+    const body = res.payload;
+    expect(body).toContain('"content":"Hel"');
+    expect(body).toContain('"content":"lo"');
+    expect(body).toContain("x_relay");
+    expect(body).toContain("data: [DONE]");
+    // Reassemble the streamed text.
+    const text = [...body.matchAll(/"content":"([^"]*)"/g)].map((m) => m[1]).join("");
+    expect(text).toBe("Hello");
+
+    // Cost/usage was written to the ledger at end-of-stream, not before.
+    expect(ledger.entries).toHaveLength(1);
+    expect(ledger.entries[0]).toMatchObject({
+      provider: "openai",
+      totalTokens: 1500,
+      outcome: "success",
+    });
+    expect(ledger.entries[0]!.costUsd).toBeCloseTo(0.00045, 10);
+
+    // Redaction still holds on the streaming path.
+    expect(body).not.toContain(KEY);
+    expect(JSON.stringify(res.headers)).not.toContain(KEY);
+
+    await app.close();
+  });
+
+  it("returns a normal JSON error (not SSE) when a stream fails before the first token", async () => {
+    // 401 before any token → pre-commit → JSON error, headers not yet sent as SSE.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("bad key", { status: 401 })));
+    const app = buildServer({
+      providers: [provider],
+      chains: [{ name: "default", strategy: "ordered", providers: [{ id: "openai" }] }],
+      ledger: new MemoryLedger(),
+      pricing: DEFAULT_PRICING,
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/chat",
+      payload: { model: "gpt-4o-mini", stream: true, messages: [{ role: "user", content: "hi" }] },
+    });
+    // Auth stops the chain: a JSON error body, not an event stream.
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("auth");
+    await app.close();
+  });
+
   it("GET /v1/usage returns recorded entries", async () => {
     const ledger = new MemoryLedger();
     ledger.record({
