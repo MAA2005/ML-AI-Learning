@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.log
+
+# Local-first storage: never commit real data or secrets
+.env
+.env.*
+!.env.example
+relay.db
+relay.db-*
+*.sqlite
+*.sqlite-*
+.relay/
+
+# Routing config is local + git-ignored; commit only the example
+relay.config.json
+relay.config.jsonc
+!relay.config.example.json
+
+# Local pricing overrides; commit only the example
+relay.pricing.json
+!relay.pricing.example.json

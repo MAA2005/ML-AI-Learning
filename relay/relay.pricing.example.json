@@ -1,0 +1,10 @@
+{
+  "//": "Copy to relay.pricing.json to override the built-in seed prices. USD per 1,000,000 tokens. VERIFY against each provider's current pricing page (linked in README) — prices change. A per-provider \"*\" model is a fallback price (e.g. free local models).",
+  "openai": {
+    "gpt-4o-mini": { "inputPerMTok": 0.15, "outputPerMTok": 0.6 },
+    "gpt-4o": { "inputPerMTok": 2.5, "outputPerMTok": 10 }
+  },
+  "ollama": {
+    "*": { "inputPerMTok": 0, "outputPerMTok": 0 }
+  }
+}
